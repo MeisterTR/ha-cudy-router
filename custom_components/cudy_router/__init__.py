@@ -65,6 +65,7 @@ PLATFORMS: Final[list[Platform]] = [
     Platform.SELECT,
     Platform.BUTTON,
     Platform.DEVICE_TRACKER,
+    Platform.TEXT,
 ]
 
 # Service constants
