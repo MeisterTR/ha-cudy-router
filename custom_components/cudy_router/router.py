@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import re
 import time
@@ -14,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 import urllib3
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from .bs4_compat import BeautifulSoup
 from .router_data import collect_router_data
@@ -50,6 +54,40 @@ class _LoginFormInfo:
 def _sha256_hex(s: str) -> str:
     """Compute SHA256 hash and return as hex string."""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _sysauth_password_hash(password: str, salt_hex: str, kdfiter: int) -> str:
+    """Mirror sysauth.js's sysauth_password_hash() for the nonce/RSA login flow.
+
+    With kdfiter > 0 this is PBKDF2-HMAC-SHA256 over the raw salt bytes; with
+    kdfiter == 0 it is a single SHA256 of password+salt (salt used as text,
+    matching the JS `password + salt` string concatenation).
+    """
+    if kdfiter > 0:
+        salt_bytes = bytes.fromhex(salt_hex)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, kdfiter, dklen=32)
+        return digest.hex()
+    return _sha256_hex(password + salt_hex)
+
+
+def _rsa_oaep_encrypt_b64(public_key_b64: str, plaintext: str) -> str:
+    """Encrypt plaintext with an RSA public key using OAEP/SHA256, base64-encoded.
+
+    Cudy's bundled jsencrypt.min.js overrides the OAEP padding to use its own
+    SHA-256 implementation for both the OAEP hash and MGF1 (hLen=32, not the
+    stock JSEncrypt SHA-1 default), so this must match SHA-256/MGF1-SHA256.
+    """
+    key_pem = base64.b64decode(public_key_b64)
+    public_key = serialization.load_pem_public_key(key_pem)
+    ciphertext = public_key.encrypt(
+        plaintext.encode("utf-8"),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return base64.b64encode(ciphertext).decode("ascii")
 
 
 def _extract_hidden(html: str, name: str) -> str:
@@ -553,6 +591,112 @@ class CudyRouter:
 
         return not self._looks_like_login_page(response.text)
 
+    def _authenticate_nonce_rsa(self) -> bool:
+        """Nonce+RSA-OAEP authentication (newer LuCI firmware, e.g. WR3000S 2.5.30+).
+
+        Mirrors sysauth.js: fetch the login form for its CSRF token, request a
+        per-attempt nonce/salt/kdfiter/RSA-public-key bundle from
+        admin/login, hash the password locally, RSA-OAEP encrypt the hash,
+        then submit the login form with the encrypted value as luci_password.
+        """
+        try:
+            form = self._discover_login_form()
+            if form is None:
+                return False
+
+            login_headers = {
+                **self._browser_headers(),
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": form.page_url,
+                "Origin": self._origin_for_url(form.page_url),
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            challenge_response = self._absolute_request(
+                "POST",
+                urllib.parse.urljoin(form.page_url, "admin/login"),
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=login_headers,
+                data=urllib.parse.urlencode({"username": self.username}),
+                allow_redirects=False,
+                silent=True,
+            )
+            if challenge_response is None or not challenge_response.ok:
+                return False
+
+            try:
+                challenge = challenge_response.json()
+            except (ValueError, json.JSONDecodeError):
+                _LOGGER.debug("Nonce/RSA auth: admin/login did not return JSON")
+                return False
+
+            salt = challenge.get("salt")
+            public_key_b64 = challenge.get("key")
+            if not (salt and public_key_b64):
+                _LOGGER.debug("Nonce/RSA auth: missing salt/key in login challenge")
+                return False
+
+            kdfiter = int(challenge.get("kdfiter") or 0)
+            nonce = challenge.get("nonce")
+
+            passhash = _sysauth_password_hash(self.password, salt, kdfiter)
+            if nonce:
+                passhash = _sysauth_password_hash(passhash, nonce, 0)
+            else:
+                pbkdf2_hash = _sysauth_password_hash(self.password, salt, 1000000)
+                passhash = f"{passhash}:{pbkdf2_hash}"
+
+            luci_password = _rsa_oaep_encrypt_b64(public_key_b64, passhash)
+
+            post_data = {
+                "_csrf": form.csrf,
+                "zonename": self._local_zonename(),
+                "timeclock": str(int(time.time())),
+                "luci_language": form.language,
+                "luci_username": self.username,
+                "luci_password": luci_password,
+            }
+            post_headers = {
+                **self._browser_headers(),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": form.page_url,
+                "Origin": self._origin_for_url(form.page_url),
+            }
+
+            response = self._absolute_request(
+                "POST",
+                form.action_url,
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=post_headers,
+                data=urllib.parse.urlencode(post_data),
+                allow_redirects=True,
+                silent=False,
+            )
+            if response is None:
+                return False
+
+            if self._extract_session_auth_cookie(response):
+                _LOGGER.debug("Nonce/RSA auth successful, got sysauth cookie")
+                return True
+
+            if self._login_confirmed_via_panel():
+                _LOGGER.debug("Nonce/RSA auth confirmed by admin panel access")
+                return True
+
+            _LOGGER.debug(
+                "Nonce/RSA auth: no sysauth cookie received, status=%s",
+                response.status_code,
+            )
+            return False
+
+        except requests.exceptions.ConnectionError as e:
+            _LOGGER.debug("Connection error during nonce/RSA auth: %s", e)
+        except requests.exceptions.Timeout as e:
+            _LOGGER.debug("Timeout during nonce/RSA auth: %s", e)
+        except Exception as e:
+            _LOGGER.warning("Nonce/RSA auth error: %s", e, exc_info=True)
+        return False
+
     def _authenticate_legacy(self) -> bool:
         """Legacy authentication method (plain password)."""
         data_url = f"{self.base_url}/cgi-bin/luci"
@@ -692,13 +836,17 @@ class CudyRouter:
         return "default"
 
     def authenticate(self) -> bool:
-        """Test if we can authenticate with the host. Tries new method first, then legacy."""
+        """Test if we can authenticate with the host. Tries newest method first, then falls back."""
         # Clear any existing session cookies
         if self._session:
             self._session.cookies.clear()
         self.auth_cookie = None
 
-        # Try new authentication method first (for 5G routers like Cudy P5)
+        # Try nonce+RSA-OAEP auth first (newer LuCI firmware, e.g. WR3000S 2.5.30+)
+        if self._authenticate_nonce_rsa():
+            return True
+
+        # Try salt/token auth (for 5G routers like Cudy P5)
         if self._authenticate_new():
             return True
 
