@@ -28,7 +28,7 @@ class _Registry:
         raise AssertionError(f"Unexpected removal: {entity_id}")
 
 
-def _set_up(monkeypatch, devices, options=None):
+def _set_up(monkeypatch, devices, options=None, registry=None):
     """Run the sensor platform setup; return the coordinator, its update listeners and each batch of added entities."""
     listeners = []
     config_entry = SimpleNamespace(
@@ -45,7 +45,7 @@ def _set_up(monkeypatch, devices, options=None):
     )
     hass = SimpleNamespace(data={const.DOMAIN: {ENTRY_ID: coordinator}})
 
-    monkeypatch.setattr(sensor, "async_get_entity_registry", lambda hass: _Registry())
+    monkeypatch.setattr(sensor, "async_get_entity_registry", lambda hass: registry or _Registry())
     monkeypatch.setattr(sensor, "known_client_devices", lambda hass, config_entry: {})
     monkeypatch.setattr(sensor, "async_cleanup_stale_client_entities", lambda *args: None)
 
@@ -95,6 +95,39 @@ def test_client_connecting_after_setup_gets_its_sensors(monkeypatch) -> None:
 
     _refresh(listeners)
     assert len(batches) == 2
+
+
+def test_client_speed_sensors_report_the_clients_current_rates(monkeypatch) -> None:
+    """Each client gets upload and download rate sensors that follow the live client list."""
+    coordinator, _listeners, batches = _set_up(monkeypatch, [LAPTOP])
+    by_id = {entity.unique_id: entity for entity in batches[0]}
+
+    upload = by_id[f"{ENTRY_ID}-device-{LAPTOP_ID}-up_speed"]
+    download = by_id[f"{ENTRY_ID}-device-{LAPTOP_ID}-down_speed"]
+    assert upload._attr_name == "Client upload"
+    assert download._attr_name == "Client download"
+    assert upload.entity_description.native_unit_of_measurement == "Mbit/s"
+    assert (upload.native_value, download.native_value) == (1.5, 12.0)
+
+    coordinator.data[const.MODULE_DEVICES][const.SECTION_DEVICE_LIST][0]["up_speed"] = 3.25
+    assert upload.native_value == 3.25
+
+
+def test_setup_keeps_existing_client_speed_sensors(monkeypatch) -> None:
+    """The cleanup of retired router-level speed sensors must leave the per-client ones alone."""
+    registry = _Registry()
+    registry.entities = {
+        "sensor.laptop_client_upload": SimpleNamespace(
+            domain="sensor",
+            platform=const.DOMAIN,
+            entity_id="sensor.laptop_client_upload",
+            unique_id=f"{ENTRY_ID}-device-{LAPTOP_ID}-up_speed",
+        ),
+    }
+
+    _set_up(monkeypatch, [LAPTOP], registry=registry)
+
+    assert "sensor.laptop_client_upload" in registry.entities
 
 
 def test_clients_connecting_later_are_not_added_when_automatic_adding_is_off(monkeypatch) -> None:
