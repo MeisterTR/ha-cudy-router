@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import re
 import time
@@ -14,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 import urllib3
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from .bs4_compat import BeautifulSoup
 from .router_data import collect_router_data
@@ -50,6 +54,40 @@ class _LoginFormInfo:
 def _sha256_hex(s: str) -> str:
     """Compute SHA256 hash and return as hex string."""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _sysauth_password_hash(password: str, salt_hex: str, kdfiter: int) -> str:
+    """Mirror sysauth.js's sysauth_password_hash() for the nonce/RSA login flow.
+
+    With kdfiter > 0 this is PBKDF2-HMAC-SHA256 over the raw salt bytes; with
+    kdfiter == 0 it is a single SHA256 of password+salt (salt used as text,
+    matching the JS `password + salt` string concatenation).
+    """
+    if kdfiter > 0:
+        salt_bytes = bytes.fromhex(salt_hex)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, kdfiter, dklen=32)
+        return digest.hex()
+    return _sha256_hex(password + salt_hex)
+
+
+def _rsa_oaep_encrypt_b64(public_key_b64: str, plaintext: str) -> str:
+    """Encrypt plaintext with an RSA public key using OAEP/SHA256, base64-encoded.
+
+    Cudy's bundled jsencrypt.min.js overrides the OAEP padding to use its own
+    SHA-256 implementation for both the OAEP hash and MGF1 (hLen=32, not the
+    stock JSEncrypt SHA-1 default), so this must match SHA-256/MGF1-SHA256.
+    """
+    key_pem = base64.b64decode(public_key_b64)
+    public_key = serialization.load_pem_public_key(key_pem)
+    ciphertext = public_key.encrypt(
+        plaintext.encode("utf-8"),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return base64.b64encode(ciphertext).decode("ascii")
 
 
 def _extract_hidden(html: str, name: str) -> str:
@@ -553,6 +591,112 @@ class CudyRouter:
 
         return not self._looks_like_login_page(response.text)
 
+    def _authenticate_nonce_rsa(self) -> bool:
+        """Nonce+RSA-OAEP authentication (newer LuCI firmware, e.g. WR3000S 2.5.30+).
+
+        Mirrors sysauth.js: fetch the login form for its CSRF token, request a
+        per-attempt nonce/salt/kdfiter/RSA-public-key bundle from
+        admin/login, hash the password locally, RSA-OAEP encrypt the hash,
+        then submit the login form with the encrypted value as luci_password.
+        """
+        try:
+            form = self._discover_login_form()
+            if form is None:
+                return False
+
+            login_headers = {
+                **self._browser_headers(),
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": form.page_url,
+                "Origin": self._origin_for_url(form.page_url),
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            challenge_response = self._absolute_request(
+                "POST",
+                urllib.parse.urljoin(form.page_url, "admin/login"),
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=login_headers,
+                data=urllib.parse.urlencode({"username": self.username}),
+                allow_redirects=False,
+                silent=True,
+            )
+            if challenge_response is None or not challenge_response.ok:
+                return False
+
+            try:
+                challenge = challenge_response.json()
+            except (ValueError, json.JSONDecodeError):
+                _LOGGER.debug("Nonce/RSA auth: admin/login did not return JSON")
+                return False
+
+            salt = challenge.get("salt")
+            public_key_b64 = challenge.get("key")
+            if not (salt and public_key_b64):
+                _LOGGER.debug("Nonce/RSA auth: missing salt/key in login challenge")
+                return False
+
+            kdfiter = int(challenge.get("kdfiter") or 0)
+            nonce = challenge.get("nonce")
+
+            passhash = _sysauth_password_hash(self.password, salt, kdfiter)
+            if nonce:
+                passhash = _sysauth_password_hash(passhash, nonce, 0)
+            else:
+                pbkdf2_hash = _sysauth_password_hash(self.password, salt, 1000000)
+                passhash = f"{passhash}:{pbkdf2_hash}"
+
+            luci_password = _rsa_oaep_encrypt_b64(public_key_b64, passhash)
+
+            post_data = {
+                "_csrf": form.csrf,
+                "zonename": self._local_zonename(),
+                "timeclock": str(int(time.time())),
+                "luci_language": form.language,
+                "luci_username": self.username,
+                "luci_password": luci_password,
+            }
+            post_headers = {
+                **self._browser_headers(),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": form.page_url,
+                "Origin": self._origin_for_url(form.page_url),
+            }
+
+            response = self._absolute_request(
+                "POST",
+                form.action_url,
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=post_headers,
+                data=urllib.parse.urlencode(post_data),
+                allow_redirects=True,
+                silent=False,
+            )
+            if response is None:
+                return False
+
+            if self._extract_session_auth_cookie(response):
+                _LOGGER.debug("Nonce/RSA auth successful, got sysauth cookie")
+                return True
+
+            if self._login_confirmed_via_panel():
+                _LOGGER.debug("Nonce/RSA auth confirmed by admin panel access")
+                return True
+
+            _LOGGER.debug(
+                "Nonce/RSA auth: no sysauth cookie received, status=%s",
+                response.status_code,
+            )
+            return False
+
+        except requests.exceptions.ConnectionError as e:
+            _LOGGER.debug("Connection error during nonce/RSA auth: %s", e)
+        except requests.exceptions.Timeout as e:
+            _LOGGER.debug("Timeout during nonce/RSA auth: %s", e)
+        except Exception as e:
+            _LOGGER.warning("Nonce/RSA auth error: %s", e, exc_info=True)
+        return False
+
     def _authenticate_legacy(self) -> bool:
         """Legacy authentication method (plain password)."""
         data_url = f"{self.base_url}/cgi-bin/luci"
@@ -692,13 +836,17 @@ class CudyRouter:
         return "default"
 
     def authenticate(self) -> bool:
-        """Test if we can authenticate with the host. Tries new method first, then legacy."""
+        """Test if we can authenticate with the host. Tries newest method first, then falls back."""
         # Clear any existing session cookies
         if self._session:
             self._session.cookies.clear()
         self.auth_cookie = None
 
-        # Try new authentication method first (for 5G routers like Cudy P5)
+        # Try nonce+RSA-OAEP auth first (newer LuCI firmware, e.g. WR3000S 2.5.30+)
+        if self._authenticate_nonce_rsa():
+            return True
+
+        # Try salt/token auth (for 5G routers like Cudy P5)
         if self._authenticate_new():
             return True
 
@@ -1648,144 +1796,84 @@ class CudyRouter:
         return await collect_router_data(self, hass, options, device_model)
 
     def reboot_mesh_device(self, mac_address: str) -> tuple[int, str]:
-        """Reboot a specific mesh device by MAC address.
+        """Reboot a specific mesh node by MAC address.
+
+        Sends what the main router's own web page sends (Mesh > the node > Operation > Reboot > OK),
+        verified on a WR3000 V1.0 with firmware 2.4.19: GET the form at
+        admin/network/mesh/reboot?client=<MAC without colons> for its token, then POST its fields (token,
+        timeclock, cbi.submit, cbid.reboot.1.client) plus cbi.apply to the same address. The router answers with a
+        redirect to admin/network/mesh/apply?command=reboot&client=<MAC>, and loading that step is what reboots
+        the node (a browser follows it by itself; the POST alone does nothing). Its answer says "Configuration
+        applied."; the node drops off within about 20 seconds and rejoins within about 2 minutes.
 
         Args:
             mac_address: The MAC address of the mesh device to reboot
 
         Returns:
-            Tuple of (HTTP status code, response snippet or error message)
+            Tuple of (HTTP status code, response snippet or error message); status 0 when it was not confirmed
         """
-        import json
-
         if not self.auth_cookie and not self.authenticate():
             _LOGGER.error("Failed to authenticate for mesh reboot")
             return 0, "Authentication failed"
 
-        # Strip colons from MAC for API call
         mac_no_colons = mac_address.replace(":", "").upper()
-
-        _LOGGER.info("Initiating reboot for mesh device %s", mac_address)
-
-        # First, get the mesh page to get a valid token
-        mesh_page_url = f"{self.base_url}/cgi-bin/luci/admin/network/mesh"
+        page = f"admin/network/mesh/reboot?client={mac_no_colons}"
         headers = {
             "User-Agent": "Mozilla/5.0",
-            "Referer": mesh_page_url,
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/mesh",
         }
-
+        _LOGGER.info("Initiating reboot for mesh device %s", mac_address)
         try:
-            resp = self._luci_get("admin/network/mesh", timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
-            token = _extract_hidden(resp.text, "token")
-            _LOGGER.debug("Got token: %s", token[:10] if token else "None")
-        except Exception as e:
-            _LOGGER.error("Failed to get mesh page for reboot: %s", e)
-            token = ""
-
-        # Try JSON endpoints first - Cudy mesh may use JSON API for reboots
-        json_endpoints = [
-            f"admin/network/mesh/client/reboot?client={mac_no_colons}",
-            f"admin/network/mesh/reboot?client={mac_no_colons}",
-            f"admin/network/mesh/node/reboot?mac={mac_no_colons}",
-        ]
-
-        for endpoint in json_endpoints:
-            try:
-                r = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+            resp = self._luci_get(page, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load the mesh reboot form"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                return 0, "No token on the mesh reboot form"
+            # The form names the node it reboots; never send it for another one.
+            client = _extract_hidden(html, "cbid.reboot.1.client")
+            if client.upper() != mac_no_colons:
+                return 0, f"The mesh reboot form is for {client or 'no device'}, not {mac_no_colons}"
+            post_fields = {
+                "token": token,
+                "timeclock": _extract_hidden(html, "timeclock"),
+                "cbi.submit": "1",
+                "cbid.reboot.1.client": mac_no_colons,
+                "cbi.apply": "",
+            }
+            r = self._luci_post(
+                page,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit the mesh reboot form"
+            if r.status_code in (301, 302, 303):
+                # Follow only the apply step for this node; anything else is left alone.
+                location = r.headers.get("Location", "")
+                step = location.split("/cgi-bin/luci/", 1)[1] if "/cgi-bin/luci/" in location else ""
+                if not (
+                    step.startswith("admin/network/mesh/apply?")
+                    and "command=reboot" in step
+                    and f"client={mac_no_colons}" in step
+                ):
+                    return 0, f"Unexpected redirect after the mesh reboot form (HTTP {r.status_code})"
+                r = self._luci_get(step, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
                 if not r:
-                    continue
-                _LOGGER.debug(
-                    "Mesh reboot GET %s: status=%d, response=%s",
-                    endpoint,
-                    r.status_code,
-                    r.text[:200] if r.text else "",
-                )
-                # Check if response indicates success
-                if r.status_code == 200:
-                    try:
-                        json_resp = (
-                            json.loads(r.text)
-                            if r.text.strip().startswith("{") or r.text.strip().startswith("[")
-                            else None
-                        )
-                        if json_resp and (json_resp.get("status") == "ok" or json_resp.get("result") == "success"):
-                            _LOGGER.info(
-                                "Mesh reboot initiated for %s via JSON endpoint",
-                                mac_address,
-                            )
-                            return r.status_code, f"Reboot initiated for {mac_address}"
-                    except json.JSONDecodeError:
-                        pass
-            except Exception as e:
-                _LOGGER.debug("JSON endpoint %s failed: %s", endpoint, e)
-
-        # Try POST endpoints with form data
-        form_endpoints = [
-            "admin/network/mesh/client/reboot",
-            "admin/network/mesh/reboot",
-            "admin/network/mesh",
-        ]
-
-        for endpoint in form_endpoints:
-            try:
-                resp = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
-                if not resp or resp.status_code == 404:
-                    continue
-
-                page_token = _extract_hidden(resp.text, "token") or token
-
-                # Try different POST field patterns
-                post_patterns = [
-                    {
-                        "token": page_token,
-                        "client": mac_no_colons,
-                        "action": "reboot",
-                        "cbi.submit": "1",
-                    },
-                    {
-                        "token": page_token,
-                        "id": mac_no_colons,
-                        "op": "reboot",
-                        "cbi.submit": "1",
-                    },
-                    {
-                        "token": page_token,
-                        "mac": mac_no_colons,
-                        "reboot": "1",
-                        "cbi.submit": "1",
-                    },
-                ]
-
-                for post_fields in post_patterns:
-                    r = self._luci_post(
-                        endpoint,
-                        timeout=DEFAULT_POST_TIMEOUT,
-                        headers={
-                            **headers,
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Origin": self.base_url,
-                        },
-                        data=urllib.parse.urlencode(post_fields),
-                        silent=True,
-                    )
-                    if not r:
-                        continue
-                    _LOGGER.debug(
-                        "Mesh reboot POST to %s with %s: status=%d",
-                        endpoint,
-                        list(post_fields.keys()),
-                        r.status_code,
-                    )
-
-            except Exception as e:
-                _LOGGER.debug("Form endpoint %s failed: %s", endpoint, e)
-
-        _LOGGER.warning(
-            "Mesh reboot control attempted for %s - endpoint may not be supported",
-            mac_address,
-        )
-        # Return success anyway - the device should reboot if the command worked
-        return 200, f"Reboot command sent for {mac_address}"
+                    return 0, "Failed to load the mesh reboot apply step"
+            if "Configuration applied" not in r.text:
+                return 0, f"The router did not confirm the mesh reboot (HTTP {r.status_code})"
+            _LOGGER.info("Mesh reboot initiated for %s", mac_address)
+            return r.status_code, f"Reboot initiated for {mac_address}"
+        except Exception as e:
+            _LOGGER.error("Mesh reboot failed for %s: %s", mac_address, e)
+            return 0, str(e)[:220]
 
     def _set_led_state(self, device_id: str, enabled: bool, label: str) -> tuple[int, str]:
         """Set LED state on mesh LED control endpoint."""

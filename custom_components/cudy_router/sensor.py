@@ -47,9 +47,11 @@ from .features import module_available
 from .sensor_descriptions import (
     CudyRouterSensorEntityDescription,
     DEVICE_CONNECTION_TYPE_SENSOR,
+    DEVICE_DOWNLOAD_SENSOR,
     DEVICE_IP_SENSOR,
     DEVICE_ONLINE_TIME_SENSOR,
     DEVICE_SIGNAL_DETAILS_SENSOR,
+    DEVICE_UPLOAD_SENSOR,
     MESH_DEVICE_BACKHAUL_SENSOR,
     MESH_DEVICE_CONNECTED_SENSOR,
     MESH_DEVICE_FIRMWARE_SENSOR,
@@ -66,6 +68,16 @@ from .sensor_descriptions import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sensors created for every connected client device: at setup, and for clients that connect later.
+CONNECTED_DEVICE_SENSOR_TYPES = (
+    DEVICE_IP_SENSOR,
+    DEVICE_CONNECTION_TYPE_SENSOR,
+    DEVICE_SIGNAL_DETAILS_SENSOR,
+    DEVICE_ONLINE_TIME_SENSOR,
+    DEVICE_UPLOAD_SENSOR,
+    DEVICE_DOWNLOAD_SENSOR,
+)
 
 _WAN_DUPLICATE_MODEM_KEYS = {
     "connected_time",
@@ -365,12 +377,7 @@ async def async_setup_entry(
             connected_devices_by_mac,
             known_clients.get(normalized_mac, {}).get("name"),
         )
-        for description in (
-            DEVICE_IP_SENSOR,
-            DEVICE_CONNECTION_TYPE_SENSOR,
-            DEVICE_SIGNAL_DETAILS_SENSOR,
-            DEVICE_ONLINE_TIME_SENSOR,
-        ):
+        for description in CONNECTED_DEVICE_SENSOR_TYPES:
             _append_entity(
                 CudyRouterConnectedDeviceSensor(
                     coordinator,
@@ -472,6 +479,43 @@ async def async_setup_entry(
                     MESH_DEVICE_BACKHAUL_SENSOR,
                 )
             )
+
+    # Client sensors are created at setup only for clients connected at that moment (and the cleanup above removes
+    # those of clients that are away), so a client that connects later had no sensors until the next restart or
+    # reload. With automatic adding on, add the same sensors when a later refresh lists a new client. Sensors only:
+    # switches and device trackers keep their own lifecycle.
+    client_macs_with_sensors: set[str] = set(allowed_client_macs)
+
+    @callback
+    def _add_new_client_sensors() -> None:
+        """Add sensors for connected clients that appeared after setup."""
+        if not auto_add_connected_devices:
+            return
+        current_devices = connected_device_lookup(_connected_devices(coordinator))
+        new_macs = sorted(set(current_devices) - client_macs_with_sensors)
+        if not new_macs:
+            return
+        new_entities: list[SensorEntity] = []
+        for normalized_mac in new_macs:
+            client_macs_with_sensors.add(normalized_mac)
+            device = build_client_seed_device(normalized_mac, current_devices)
+            for description in CONNECTED_DEVICE_SENSOR_TYPES:
+                entity = CudyRouterConnectedDeviceSensor(coordinator, config_entry, device, description)
+                unique_id = entity.unique_id
+                if unique_id and unique_id in seen_unique_ids:
+                    continue
+                if unique_id:
+                    seen_unique_ids.add(unique_id)
+                new_entities.append(entity)
+        if new_entities:
+            _LOGGER.debug(
+                "Adding %d sensors for %d client(s) that connected after setup",
+                len(new_entities),
+                len(new_macs),
+            )
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_add_new_client_sensors))
 
     @callback
     def _add_new_wan_interface_sensors() -> None:

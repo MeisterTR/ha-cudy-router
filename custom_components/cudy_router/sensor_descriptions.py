@@ -769,10 +769,12 @@ DEVICE_ONLINE_TIME_SENSOR = CudyRouterSensorEntityDescription(
     entity_category=EntityCategory.DIAGNOSTIC,
 )
 
+# Per-client rates: named "Client upload/download" so their entity IDs (sensor.<client>_client_upload) stay
+# distinct from the routers' own upload/download speed sensors and are easy to filter, e.g. from the recorder.
 DEVICE_UPLOAD_SENSOR = CudyRouterSensorEntityDescription(
     key="up_speed",
     module="devices",
-    name_suffix="Upload speed",
+    name_suffix="Client upload",
     device_class=SensorDeviceClass.DATA_RATE,
     native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
     state_class=SensorStateClass.MEASUREMENT,
@@ -781,7 +783,7 @@ DEVICE_UPLOAD_SENSOR = CudyRouterSensorEntityDescription(
 DEVICE_DOWNLOAD_SENSOR = CudyRouterSensorEntityDescription(
     key="down_speed",
     module="devices",
-    name_suffix="Download speed",
+    name_suffix="Client download",
     device_class=SensorDeviceClass.DATA_RATE,
     native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
     state_class=SensorStateClass.MEASUREMENT,
