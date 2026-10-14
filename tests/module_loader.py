@@ -147,6 +147,23 @@ def _ensure_homeassistant_stub() -> None:
         button_module.ButtonEntity = ButtonEntity
         sys.modules["homeassistant.components.button"] = button_module
 
+    text_module = sys.modules.get("homeassistant.components.text")
+    if text_module is None:
+        text_module = types.ModuleType("homeassistant.components.text")
+
+        class TextEntity:
+            @property
+            def unique_id(self):
+                return getattr(self, "_attr_unique_id", None)
+
+        class TextMode:
+            PASSWORD = "password"
+            TEXT = "text"
+
+        text_module.TextEntity = TextEntity
+        text_module.TextMode = TextMode
+        sys.modules["homeassistant.components.text"] = text_module
+
     config_entries_module = sys.modules.get("homeassistant.config_entries")
     if config_entries_module is None:
         config_entries_module = types.ModuleType("homeassistant.config_entries")

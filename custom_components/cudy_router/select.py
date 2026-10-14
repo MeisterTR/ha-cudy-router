@@ -1,10 +1,4 @@
-"""Support for Cudy Router select entities.
-
-GEÄNDERT gegenüber dem Original (usersaynoso/ha-cudy-router):
-- Neue Klasse CudyWispNetworkSelect ("WISP: Netzwerk") am Ende der Datei,
-  registriert in async_setup_entry() (Abschnitt "NEU"). Alles andere
-  unverändert zum Original.
-"""
+"""Support for Cudy Router select entities."""
 
 from __future__ import annotations
 
@@ -201,10 +195,9 @@ async def async_setup_entry(
         if entity_id:
             entity_registry.async_remove(entity_id)
 
-    # --- NEU: WISP-Netzwerkauswahl (Scan-Ergebnisse) ------------------------
+    # WISP network picker (scan results)
     if module_available(device_model, MODULE_WISP, coordinator.data):
         entities.append(CudyWispNetworkSelect(coordinator))
-    # -------------------------------------------------------------------------
 
     async_add_entities(entities)
 
@@ -305,11 +298,8 @@ class CudyRouterSettingSelect(
             )
 
 
-# --- NEU: WISP-Netzwerkauswahl ------------------------------------------------
-
-
 def _unique_ssid_options(coordinator: CudyRouterDataUpdateCoordinator) -> list[str]:
-    """Eindeutige SSIDs aus dem letzten Scan, stärkstes Signal zuerst."""
+    """Unique SSIDs from the last scan, strongest signal first."""
     networks = getattr(coordinator, "wisp_networks", [])
     seen: list[str] = []
     for network in networks:
@@ -318,23 +308,22 @@ def _unique_ssid_options(coordinator: CudyRouterDataUpdateCoordinator) -> list[s
     return seen or [NO_NETWORKS_LABEL]
 
 
-NO_NETWORKS_LABEL = "— bitte zuerst scannen —"
+NO_NETWORKS_LABEL = "Scan first"
 
 
 class CudyWispNetworkSelect(
     CoordinatorEntity[CudyRouterDataUpdateCoordinator], SelectEntity
 ):
-    """Auswahl eines per WISP-Scan gefundenen WLAN-Netzes.
+    """Picker for a Wi-Fi network found by the WISP scan.
 
-    Die Optionsliste kommt aus `coordinator.wisp_networks`, befüllt vom
-    Button `button.*_wisp_netze_suchen` (siehe button.py). Die getroffene
-    Auswahl liegt in `coordinator.wisp_selected_ssid` und wird vom Button
-    `button.*_wisp_verbinden` gelesen.
+    The options come from `coordinator.wisp_networks`, filled by the
+    `button.*_wisp_scan` button (see button.py). The choice is kept in
+    `coordinator.wisp_selected_ssid` and read by `button.*_wisp_connect`.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:wifi-star"
-    _attr_name = "WISP: Netzwerk"
+    _attr_name = "WISP network"
 
     def __init__(self, coordinator: CudyRouterDataUpdateCoordinator) -> None:
         super().__init__(coordinator)
@@ -357,16 +346,15 @@ class CudyWispNetworkSelect(
     def extra_state_attributes(self) -> dict[str, Any]:
         networks = getattr(self.coordinator, "wisp_networks", [])
 
-        # Komplette Scan-Liste für Dashboard-Tabellen (z.B. Markdown-Karte),
-        # eine Zeile pro SSID (stärkstes Signal zuerst, da networks bereits so
-        # sortiert ist - erste Fundstelle je SSID gewinnt).
-        netzwerkliste: list[dict[str, Any]] = []
+        # Full scan list for dashboard tables (e.g. a Markdown card), one row per
+        # SSID; networks is sorted strongest first, so the first hit per SSID wins.
+        network_list: list[dict[str, Any]] = []
         seen_ssids: set[str] = set()
         for n in networks:
             if n["ssid"] in seen_ssids:
                 continue
             seen_ssids.add(n["ssid"])
-            netzwerkliste.append(
+            network_list.append(
                 {
                     "ssid": n["ssid"],
                     "bssid": n["bssid"],
@@ -377,8 +365,8 @@ class CudyWispNetworkSelect(
             )
 
         attrs: dict[str, Any] = {
-            "gefundene_netze": len(netzwerkliste),
-            "netzwerkliste": netzwerkliste,
+            "networks_found": len(network_list),
+            "networks": network_list,
         }
 
         match = next((n for n in networks if n["ssid"] == self.current_option), None)

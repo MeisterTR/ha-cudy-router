@@ -1,29 +1,21 @@
-"""WISP Scan & Connect - Erweiterung für die cudy_router Integration.
+"""WISP scan and connect support for the Cudy Router integration.
 
-Neue Datei, die in `custom_components/cudy_router/` abgelegt wird (gleiche
-Ebene wie `router.py`, `select.py`, `button.py`). Enthält die Funktionen für
-WLAN-Scan und -Connect im WISP-Uplink-Modus, die im offiziellen Repo
-(usersaynoso/ha-cudy-router) bisher fehlen - laut Quellcode-Analyse bietet
-`set_wisp_setting()` nur `enabled` (An/Aus), aber keinen Scan oder Connect.
+Adds scanning for Wi-Fi networks and joining one as the WISP uplink, which
+``CudyRouter.set_wisp_setting()`` (enable/disable only) does not cover.
 
-Reverse-Engineered am 2026-07-11 live gegen Firmware 2.5.12-20260518-234632
-per Browser-Session (siehe Bau-Logbuch in
-'1 - Projekte/Smarter Caravan/Smarter Caravan.md').
+Reverse-engineered from the router's own web UI (firmware 2.5.12). It reuses
+the session, token and retry handling of ``CudyRouter`` (``get``, ``_luci_get``,
+``_luci_post``, ``_submit_form``) like the existing ``set_*_setting()`` methods.
 
-Nutzt bewusst die vorhandene Session-/Token-/Retry-Infrastruktur der
-`CudyRouter`-Klasse (`_luci_get`, `_luci_post`, `_submit_form`, `get`,
-`_extract_hidden`) statt eigene HTTP-Logik zu duplizieren - dieselben
-Konventionen wie die bestehenden `set_*_setting()`-Methoden in router.py.
-
-API-Ablauf (aus dem Netzwerk-Log der echten LuCI-Oberfläche):
-1. POST admin/network/wireless/wds/doscan          -> startet Scan (blockiert ~15s)
-2. GET  admin/network/wireless/wds/scan?embedded=&nomodal=&mode=wisp
-        -> HTML-Tabelle mit gefundenen Netzen
-3. GET  admin/network/wireless/wds/join?embedded=&nomodal=&mode=wisp&ssid=..&bssid=..&iface=wlan00
-        -> vorausgefülltes Formular (token, cbid.wireless.wdstmp.ssid/key/iface,
-           cbid.network.wisp.proto/hostname)
-4. POST derselbe Pfad mit Passwort-Override -> verbindet (inkl. Apply-Workflow,
-        das `_submit_form()` bereits automatisch mit abhandelt)
+Request flow, as sent by the LuCI web UI:
+1. POST admin/network/wireless/wds/doscan: starts the scan (blocks for ~15 s).
+2. GET  admin/network/wireless/wds/scan?embedded=&nomodal=&mode=wisp:
+        HTML table of the networks found.
+3. GET  admin/network/wireless/wds/join?embedded=&nomodal=&mode=wisp&ssid=..&bssid=..&iface=wlan00:
+        pre-filled form (token, cbid.wireless.wdstmp.ssid/key/iface,
+        cbid.network.wisp.proto/hostname).
+4. POST the same path with the password filled in: joins the network. The
+        apply step is handled by ``_submit_form()``.
 """
 from __future__ import annotations
 
@@ -46,18 +38,18 @@ WISP_IFACE = "wlan00"
 
 
 def _extract_hidden(html: str, name: str) -> str:
-    """Gleiche Regex wie router.py::_extract_hidden (dupliziert, um router.py
-    nicht anfassen zu müssen)."""
+    """Extract the value of a hidden input field."""
     match = re.search(r'name="%s"[^>]*value="([^"]*)"' % re.escape(name), html)
     return match.group(1) if match else ""
 
 
 def _dedupe_cell_text(text: str) -> str:
-    """Die Scan-Tabelle enthält pro Zelle ein Accessibility-Duplikat (sichtbarer
-    + versteckter Screenreader-Text), das BeautifulSoups get_text() ohne
-    Trennzeichen zusammenklebt - z.B. "Zeeuwse Kust – FreeZeeuwse Kust – Free"
-    statt "Zeeuwse Kust – Free". Erkennt exakte Verdopplung (gerade Länge,
-    beide Hälften identisch) und kürzt auf die erste Hälfte."""
+    """Collapse the doubled text of a scan table cell.
+
+    Each cell holds a visible and a hidden screen-reader copy of its text, which
+    ``get_text()`` glues together without a separator ("Free WiFiFree WiFi").
+    An exact doubling (even length, identical halves) is cut back to one copy.
+    """
     n = len(text)
     if n > 0 and n % 2 == 0:
         half = n // 2
@@ -67,16 +59,16 @@ def _dedupe_cell_text(text: str) -> str:
 
 
 def _parse_wisp_scan_networks(html: str) -> list[dict[str, Any]]:
-    """Parst die Scan-Ergebnis-Tabelle der WISP-Seite.
+    """Parse the scan result table of the WISP page.
 
-    Jede Datenzeile hat 9 <td>: [No, Band, BSSID, SSID(lang), SSID(kurz),
-    Kanal, Signal, -, Verbinden-Button]. Ein <i class="icon icon-lock">
-    markiert verschlüsselte Netze, "icon-none" offene.
+    Each data row has 9 <td>: [No, Band, BSSID, long SSID, short SSID, channel,
+    signal, -, connect button]. An <i class="icon icon-lock"> marks encrypted
+    networks and "icon-none" open ones.
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="table-striped")
     if table is None:
-        _LOGGER.debug("WISP scan: kein Ergebnis-Table im HTML gefunden")
+        _LOGGER.debug("WISP scan: no result table found in the HTML")
         return []
 
     networks: list[dict[str, Any]] = []
@@ -84,7 +76,7 @@ def _parse_wisp_scan_networks(html: str) -> list[dict[str, Any]]:
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) != 9:
-            continue  # Header- oder Spacer-Zeile
+            continue  # header or spacer row
 
         band = _dedupe_cell_text(tds[1].get_text(strip=True))
         bssid = _dedupe_cell_text(tds[2].get_text(strip=True))
@@ -122,27 +114,24 @@ def _parse_wisp_scan_networks(html: str) -> list[dict[str, Any]]:
 
 
 def scan_wisp(api: "CudyRouter") -> tuple[int, list[dict[str, Any]] | str]:
-    """Startet einen WISP-WLAN-Scan und liefert die gefundenen Netze.
+    """Run a WISP Wi-Fi scan and return the networks found.
 
-    Rückgabe (status_code, ergebnis) - bei Erfolg ist ergebnis eine Liste von
-    dicts {ssid, bssid, band, channel, signal_dbm, encrypted}, bei Fehler ein
-    Fehlertext (analog zu den bestehenden set_*_setting()-Methoden).
+    Returns (status_code, result). On success result is a list of dicts
+    {ssid, bssid, band, channel, signal_dbm, encrypted}; on failure it is an
+    error message, like the existing set_*_setting() methods.
     """
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": f"{api.base_url}/cgi-bin/luci/admin/network/wireless/wds",
     }
 
-    # Dieselbe Seite, die auch set_wisp_setting() in router.py für den
-    # CSRF-Token nutzt (admin/setup redirectete im Backend-Request ohne
-    # Browser-Session teils ohne Token-Feld - dieser Pfad ist im Original
-    # bereits als zuverlässig erprobt).
+    # The same page set_wisp_setting() uses for the CSRF token.
     token_html = api.get(
         "admin/network/wireless/wds/config?nomodal=&mode=wisp", True
     )
     token = _extract_hidden(token_html, "token")
     if not token:
-        return 0, "Kein CSRF-Token gefunden (Login-Session abgelaufen?)"
+        return 0, "No CSRF token found (login session expired?)"
 
     post_resp = api._luci_post(
         "admin/network/wireless/wds/doscan",
@@ -155,7 +144,7 @@ def scan_wisp(api: "CudyRouter") -> tuple[int, list[dict[str, Any]] | str]:
         data=urllib.parse.urlencode({"token": token, "timeclock": str(int(time.time()))}),
     )
     if not post_resp:
-        return 0, "WISP-Scan konnte nicht gestartet werden (doscan fehlgeschlagen)"
+        return 0, "Could not start the WISP scan (doscan failed)"
 
     scan_resp = api._luci_get(
         "admin/network/wireless/wds/scan?embedded=&nomodal=&mode=wisp",
@@ -163,7 +152,7 @@ def scan_wisp(api: "CudyRouter") -> tuple[int, list[dict[str, Any]] | str]:
         headers=headers,
     )
     if not scan_resp:
-        return 0, "WISP-Scan-Ergebnis konnte nicht geladen werden"
+        return 0, "Could not load the WISP scan result"
 
     networks = _parse_wisp_scan_networks(scan_resp.text)
     return scan_resp.status_code, networks
@@ -174,16 +163,15 @@ def join_wisp(
     ssid: str,
     bssid: str,
     key: str,
-    hostname: str = "LT300",
-    proto: str = "dhcp",
+    hostname: str | None = None,
+    proto: str | None = None,
 ) -> tuple[int, str]:
-    """Verbindet den WISP-Uplink mit dem angegebenen WLAN-Netz.
+    """Join the given Wi-Fi network as the WISP uplink.
 
-    Nutzt _submit_form() wie die bestehenden set_*_setting()-Methoden: GET auf
-    die vorausgefüllte Join-Seite (ssid/bssid/iface via Query-Param), Overrides
-    fürs Passwort/Protokoll/Hostname drüberlegen, POST zurück - inkl. dem in
-    _submit_form() bereits eingebauten Apply-Workflow (Warten auf
-    "Konfiguration angewendet").
+    Uses _submit_form() like the existing set_*_setting() methods: GET the
+    pre-filled join page (ssid/bssid/iface as query parameters), override the
+    password, POST it back and run the apply workflow. The protocol and
+    hostname keep the router's pre-filled values unless given.
     """
     quoted_ssid = urllib.parse.quote(ssid)
     quoted_bssid = urllib.parse.quote(bssid)
@@ -191,11 +179,11 @@ def join_wisp(
         "admin/network/wireless/wds/join"
         f"?embedded=&nomodal=&mode=wisp&ssid={quoted_ssid}&bssid={quoted_bssid}&iface={WISP_IFACE}"
     )
-    overrides = {
-        "cbid.wireless.wdstmp.key": key or "",
-        "cbid.network.wisp.proto": proto,
-        "cbid.network.wisp.hostname": hostname,
-    }
+    overrides = {"cbid.wireless.wdstmp.key": key or ""}
+    if proto:
+        overrides["cbid.network.wisp.proto"] = proto
+    if hostname:
+        overrides["cbid.network.wisp.hostname"] = hostname
     return api._submit_form(
         fetch_path,
         overrides,

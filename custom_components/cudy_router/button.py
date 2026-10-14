@@ -1,12 +1,4 @@
-"""Support for Cudy Router Button Platform.
-
-GEÄNDERT gegenüber dem Original (usersaynoso/ha-cudy-router):
-- Import von `module_available`, `MODULE_WISP`, `CONF_MODEL` ergänzt
-- Import `scan_wisp`, `join_wisp` aus der neuen Datei `wisp_extra.py`
-- Zwei neue Buttons: CudyWispScanButton ("WISP: Netze suchen") und
-  CudyWispConnectButton ("WISP: Verbinden") - siehe Abschnitt "NEU" unten.
-  Alles andere ist unverändert zum Original.
-"""
+"""Support for Cudy Router Button Platform."""
 
 from __future__ import annotations
 
@@ -57,12 +49,11 @@ async def async_setup_entry(
         )
     )
 
-    # --- NEU: WISP Scan & Connect Buttons -----------------------------------
+    # WISP scan and connect buttons
     device_model = config_entry.data.get(CONF_MODEL, "default")
     if module_available(device_model, MODULE_WISP, coordinator.data):
         entities.append(CudyWispScanButton(coordinator, router_name))
         entities.append(CudyWispConnectButton(coordinator, router_name))
-    # -------------------------------------------------------------------------
 
     # Add mesh device reboot buttons
     if coordinator.data:
@@ -160,23 +151,19 @@ class CudyMeshRebootButton(
             )
 
 
-# --- NEU: WISP Scan & Connect ------------------------------------------------
-
-
 class CudyWispScanButton(
     CoordinatorEntity[CudyRouterDataUpdateCoordinator], ButtonEntity
 ):
-    """Button, der einen WISP-WLAN-Scan startet und die Ergebnisse ablegt.
+    """Button that runs a WISP Wi-Fi scan and stores the results.
 
-    Die gefundenen Netze landen in `coordinator.wisp_networks` (Liste von
-    dicts) und werden per `async_update_listeners()` an `select.*_wisp_netzwerk`
-    durchgereicht, ohne den regulären Polling-Zyklus des Coordinators (der alle
-    anderen Sensoren aktualisiert) zu beeinflussen.
+    The networks found are kept in `coordinator.wisp_networks` (a list of dicts)
+    and pushed to `select.*_wisp_network` via `async_update_listeners()`, without
+    touching the regular polling cycle that updates all other sensors.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:wifi-refresh"
-    _attr_name = "WISP: Netze suchen"
+    _attr_name = "WISP scan"
 
     def __init__(
         self,
@@ -188,7 +175,7 @@ class CudyWispScanButton(
         self._attr_device_info = build_router_device_info(coordinator)
 
     async def async_press(self) -> None:
-        """Startet den Scan (dauert auf dem Router selbst ~15s)."""
+        """Start the scan (takes about 15 s on the router)."""
         _LOGGER.info("Starting WISP WiFi scan")
         status, result = await self.hass.async_add_executor_job(
             scan_wisp, self.coordinator.api
@@ -205,13 +192,13 @@ class CudyWispScanButton(
 class CudyWispConnectButton(
     CoordinatorEntity[CudyRouterDataUpdateCoordinator], ButtonEntity
 ):
-    """Button, der den WISP-Uplink mit dem in `select.*_wisp_netzwerk`
-    ausgewählten Netz verbindet, mit dem Passwort aus `text.*_wisp_passwort`.
+    """Button that joins the WISP uplink to the network chosen in
+    `select.*_wisp_network`, using the password from `text.*_wisp_password`.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:wifi-plus"
-    _attr_name = "WISP: Verbinden"
+    _attr_name = "WISP connect"
 
     def __init__(
         self,
@@ -229,14 +216,14 @@ class CudyWispConnectButton(
 
         if not selected_ssid:
             _LOGGER.error(
-                "WISP connect: kein Netzwerk ausgewählt (select.*_wisp_netzwerk)"
+                "WISP connect: no network selected (select.*_wisp_network)"
             )
             return
 
         match = next((n for n in networks if n["ssid"] == selected_ssid), None)
         if not match:
             _LOGGER.error(
-                "WISP connect: '%s' nicht im letzten Scan-Ergebnis - bitte neu scannen",
+                "WISP connect: '%s' is not in the last scan result - please scan again",
                 selected_ssid,
             )
             return

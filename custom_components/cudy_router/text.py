@@ -1,13 +1,4 @@
-"""Neue Plattform: text-Entity für das WISP-WLAN-Passwort.
-
-Neue Datei für `custom_components/cudy_router/text.py`. Home Assistant hat
-keine eingebaute "Passwort eingeben"-Karte für Buttons/Selects, aber die
-native `text`-Domain mit `mode="password"` erledigt das sauber (maskiertes
-Eingabefeld im Dashboard).
-
-Wichtig: Platform.TEXT muss in `__init__.py` zur PLATFORMS-Liste ergänzt
-werden - siehe README.md in diesem Ordner für die genaue Änderung.
-"""
+"""Text entity for the WISP Wi-Fi password."""
 
 from __future__ import annotations
 
@@ -26,6 +17,8 @@ from .device_info import build_router_device_info
 from .features import module_available
 
 _LOGGER = logging.getLogger(__name__)
+
+PASSWORD_MASK = "********"
 
 
 async def async_setup_entry(
@@ -47,16 +40,17 @@ async def async_setup_entry(
 class CudyWispPasswordText(
     CoordinatorEntity[CudyRouterDataUpdateCoordinator], TextEntity
 ):
-    """Passwort-Eingabefeld für die WISP-Verbindung.
+    """Password input for the WISP connection.
 
-    Wert liegt (nur im Speicher, nicht persistiert) in
-    `coordinator.wisp_password` und wird von `button.*_wisp_verbinden`
-    gelesen. Leer lassen für offene Netze.
+    The value is kept in memory only (not persisted) in `coordinator.wisp_password`
+    and read by `button.*_wisp_connect`. Leave empty for open networks. The entity
+    is write-only: its state never contains the password, because entity states
+    are stored in the recorder history.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:wifi-lock"
-    _attr_name = "WISP: Passwort"
+    _attr_name = "WISP password"
     _attr_mode = TextMode.PASSWORD
     _attr_native_max = 63
 
@@ -67,7 +61,7 @@ class CudyWispPasswordText(
 
     @property
     def native_value(self) -> str:
-        return getattr(self.coordinator, "wisp_password", "") or ""
+        return PASSWORD_MASK if getattr(self.coordinator, "wisp_password", "") else ""
 
     async def async_set_value(self, value: str) -> None:
         self.coordinator.wisp_password = value

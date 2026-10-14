@@ -20,6 +20,7 @@ This project is not endorsed, maintained, or supported by Cudy.
 - Local polling integration with Home Assistant config flow and options flow.
 - Router-wide sensors for modem/cellular, WAN, LAN, DHCP, VPN, load balancing, Wi-Fi, SMS, traffic, and system status, including CPU/RAM usage when the router reports it.
 - Writable router settings exposed as Home Assistant `switch` and `select` entities when the router supports them.
+- WISP uplink scan and connect on supported models: a **WISP scan** button, a **WISP network** picker, a write-only **WISP password** field, and a **WISP connect** button.
 - Reboot buttons and services for SMS, AT commands, 5G connection restart, and band switching.
 - Mesh node support with separate Home Assistant devices, per-node LED control, and per-node reboot.
 - Connected client devices, per-client controls, and optional `device_tracker` entities.
@@ -67,7 +68,7 @@ The integration normalizes the host automatically. If you enter `192.168.10.1`, 
 
 ## What It Creates
 
-The integration creates entities on these Home Assistant platforms: `sensor`, `switch`, `select`, `button`, and `device_tracker`.
+The integration creates entities on these Home Assistant platforms: `sensor`, `switch`, `select`, `button`, `text`, and `device_tracker`.
 
 Entity availability depends on the router model and firmware. Not every router exposes every page or field.
 
