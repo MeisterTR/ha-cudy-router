@@ -1648,144 +1648,84 @@ class CudyRouter:
         return await collect_router_data(self, hass, options, device_model)
 
     def reboot_mesh_device(self, mac_address: str) -> tuple[int, str]:
-        """Reboot a specific mesh device by MAC address.
+        """Reboot a specific mesh node by MAC address.
+
+        Sends what the main router's own web page sends (Mesh > the node > Operation > Reboot > OK),
+        verified on a WR3000 V1.0 with firmware 2.4.19: GET the form at
+        admin/network/mesh/reboot?client=<MAC without colons> for its token, then POST its fields (token,
+        timeclock, cbi.submit, cbid.reboot.1.client) plus cbi.apply to the same address. The router answers with a
+        redirect to admin/network/mesh/apply?command=reboot&client=<MAC>, and loading that step is what reboots
+        the node (a browser follows it by itself; the POST alone does nothing). Its answer says "Configuration
+        applied."; the node drops off within about 20 seconds and rejoins within about 2 minutes.
 
         Args:
             mac_address: The MAC address of the mesh device to reboot
 
         Returns:
-            Tuple of (HTTP status code, response snippet or error message)
+            Tuple of (HTTP status code, response snippet or error message); status 0 when it was not confirmed
         """
-        import json
-
         if not self.auth_cookie and not self.authenticate():
             _LOGGER.error("Failed to authenticate for mesh reboot")
             return 0, "Authentication failed"
 
-        # Strip colons from MAC for API call
         mac_no_colons = mac_address.replace(":", "").upper()
-
-        _LOGGER.info("Initiating reboot for mesh device %s", mac_address)
-
-        # First, get the mesh page to get a valid token
-        mesh_page_url = f"{self.base_url}/cgi-bin/luci/admin/network/mesh"
+        page = f"admin/network/mesh/reboot?client={mac_no_colons}"
         headers = {
             "User-Agent": "Mozilla/5.0",
-            "Referer": mesh_page_url,
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/mesh",
         }
-
+        _LOGGER.info("Initiating reboot for mesh device %s", mac_address)
         try:
-            resp = self._luci_get("admin/network/mesh", timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
-            token = _extract_hidden(resp.text, "token")
-            _LOGGER.debug("Got token: %s", token[:10] if token else "None")
-        except Exception as e:
-            _LOGGER.error("Failed to get mesh page for reboot: %s", e)
-            token = ""
-
-        # Try JSON endpoints first - Cudy mesh may use JSON API for reboots
-        json_endpoints = [
-            f"admin/network/mesh/client/reboot?client={mac_no_colons}",
-            f"admin/network/mesh/reboot?client={mac_no_colons}",
-            f"admin/network/mesh/node/reboot?mac={mac_no_colons}",
-        ]
-
-        for endpoint in json_endpoints:
-            try:
-                r = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+            resp = self._luci_get(page, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load the mesh reboot form"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                return 0, "No token on the mesh reboot form"
+            # The form names the node it reboots; never send it for another one.
+            client = _extract_hidden(html, "cbid.reboot.1.client")
+            if client.upper() != mac_no_colons:
+                return 0, f"The mesh reboot form is for {client or 'no device'}, not {mac_no_colons}"
+            post_fields = {
+                "token": token,
+                "timeclock": _extract_hidden(html, "timeclock"),
+                "cbi.submit": "1",
+                "cbid.reboot.1.client": mac_no_colons,
+                "cbi.apply": "",
+            }
+            r = self._luci_post(
+                page,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit the mesh reboot form"
+            if r.status_code in (301, 302, 303):
+                # Follow only the apply step for this node; anything else is left alone.
+                location = r.headers.get("Location", "")
+                step = location.split("/cgi-bin/luci/", 1)[1] if "/cgi-bin/luci/" in location else ""
+                if not (
+                    step.startswith("admin/network/mesh/apply?")
+                    and "command=reboot" in step
+                    and f"client={mac_no_colons}" in step
+                ):
+                    return 0, f"Unexpected redirect after the mesh reboot form (HTTP {r.status_code})"
+                r = self._luci_get(step, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
                 if not r:
-                    continue
-                _LOGGER.debug(
-                    "Mesh reboot GET %s: status=%d, response=%s",
-                    endpoint,
-                    r.status_code,
-                    r.text[:200] if r.text else "",
-                )
-                # Check if response indicates success
-                if r.status_code == 200:
-                    try:
-                        json_resp = (
-                            json.loads(r.text)
-                            if r.text.strip().startswith("{") or r.text.strip().startswith("[")
-                            else None
-                        )
-                        if json_resp and (json_resp.get("status") == "ok" or json_resp.get("result") == "success"):
-                            _LOGGER.info(
-                                "Mesh reboot initiated for %s via JSON endpoint",
-                                mac_address,
-                            )
-                            return r.status_code, f"Reboot initiated for {mac_address}"
-                    except json.JSONDecodeError:
-                        pass
-            except Exception as e:
-                _LOGGER.debug("JSON endpoint %s failed: %s", endpoint, e)
-
-        # Try POST endpoints with form data
-        form_endpoints = [
-            "admin/network/mesh/client/reboot",
-            "admin/network/mesh/reboot",
-            "admin/network/mesh",
-        ]
-
-        for endpoint in form_endpoints:
-            try:
-                resp = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
-                if not resp or resp.status_code == 404:
-                    continue
-
-                page_token = _extract_hidden(resp.text, "token") or token
-
-                # Try different POST field patterns
-                post_patterns = [
-                    {
-                        "token": page_token,
-                        "client": mac_no_colons,
-                        "action": "reboot",
-                        "cbi.submit": "1",
-                    },
-                    {
-                        "token": page_token,
-                        "id": mac_no_colons,
-                        "op": "reboot",
-                        "cbi.submit": "1",
-                    },
-                    {
-                        "token": page_token,
-                        "mac": mac_no_colons,
-                        "reboot": "1",
-                        "cbi.submit": "1",
-                    },
-                ]
-
-                for post_fields in post_patterns:
-                    r = self._luci_post(
-                        endpoint,
-                        timeout=DEFAULT_POST_TIMEOUT,
-                        headers={
-                            **headers,
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Origin": self.base_url,
-                        },
-                        data=urllib.parse.urlencode(post_fields),
-                        silent=True,
-                    )
-                    if not r:
-                        continue
-                    _LOGGER.debug(
-                        "Mesh reboot POST to %s with %s: status=%d",
-                        endpoint,
-                        list(post_fields.keys()),
-                        r.status_code,
-                    )
-
-            except Exception as e:
-                _LOGGER.debug("Form endpoint %s failed: %s", endpoint, e)
-
-        _LOGGER.warning(
-            "Mesh reboot control attempted for %s - endpoint may not be supported",
-            mac_address,
-        )
-        # Return success anyway - the device should reboot if the command worked
-        return 200, f"Reboot command sent for {mac_address}"
+                    return 0, "Failed to load the mesh reboot apply step"
+            if "Configuration applied" not in r.text:
+                return 0, f"The router did not confirm the mesh reboot (HTTP {r.status_code})"
+            _LOGGER.info("Mesh reboot initiated for %s", mac_address)
+            return r.status_code, f"Reboot initiated for {mac_address}"
+        except Exception as e:
+            _LOGGER.error("Mesh reboot failed for %s: %s", mac_address, e)
+            return 0, str(e)[:220]
 
     def _set_led_state(self, device_id: str, enabled: bool, label: str) -> tuple[int, str]:
         """Set LED state on mesh LED control endpoint."""
